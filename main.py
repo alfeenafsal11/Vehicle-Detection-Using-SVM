@@ -1,71 +1,188 @@
-# detector.py
 import cv2
+import numpy as np
 import os
+import glob
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
 
-# import your model loading and detection helper(s)
-# e.g. from your_module import load_svm_model, detect_boxes_in_frame
+POSITIVE_TRAINING_VIDEO = "C:/Users/HP/PycharmProjects/SVM_Vehicle_Detection/vehicles.mp4"
+NEGATIVE_TRAINING_VIDEO = "C:/Users/HP/PycharmProjects/SVM_Vehicle_Detection/empty_road.mp4"
+POSITIVE_TRAINING_SET_PATH = "C:/Users/HP/PycharmProjects/SVM_Vehicle_Detection/DATASET/POSITIVE"
+NEGATIVE_TRAINING_SET_PATH = "C:/Users/HP/PycharmProjects/SVM_Vehicle_Detection/DATASET/NEGATIVE"
+TRAFFIC_VIDEO_FILE = r"C:\Users\HP\PycharmProjects\SVM_Vehicle_Detection\video.mp4"
+TRAINED_SVM = r"C:\Users\HP\PycharmProjects\SVM_Vehicle_Detection\vehicle_detector.yml"
+WINDOW_NAME = "WINDOW"
+IMAGE_SIZE = (40, 40)
+EVALUATE_ONLY=True
 
-# -- model init (load once) --
-# model = load_svm_model("svm_model.joblib")
-# hog = init_hog()   # if you have an init function
+def model_exists(filepath):
+    return os.path.exists(filepath)
+    # return False
+def file_paths(directory):
+    return glob.glob(os.path.join(directory, "*"))
 
-def detect_vehicles_in_video(input_path: str, output_path: str = "outputs/out.mp4",
-                             resize_to: tuple = None, frame_step: int = 1) -> dict:
-    """
-    Processes input_path, writes annotated video to output_path.
-    Returns stats dict: {"total_vehicles": int}
-    - resize_to: optional (w, h) to resize frames before detection (faster)
-    - frame_step: process every nth frame (skip frames to speed up)
-    """
-    cap = cv2.VideoCapture(input_path)
+def load_images(directory):
+    image_list = []
+    for file in file_paths(directory):
+        img = cv2.imread(file)
+        if img is not None:
+            img = cv2.resize(img, IMAGE_SIZE)
+            image_list.append(img)
+    return image_list
+
+def hog_calculator(image_list):
+    hog = cv2.HOGDescriptor(_winSize=IMAGE_SIZE,
+                            _blockSize=(16, 16),
+                            _blockStride=(8, 8),
+                            _cellSize=(8, 8),
+                            _nbins=9)
+    gradients = []
+    for img in image_list:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        descriptors = hog.compute(gray)
+        gradients.append(descriptors.flatten())
+    return gradients
+
+def hog_convertor(gradient_list):
+    return np.array(gradient_list, dtype=np.float32)
+
+def train_svm_model(gradient_list, labels):
+    print("Training SVM...")
+    svm = cv2.ml.SVM_create()
+    svm.setCoef0(0.0)
+    svm.setDegree(3)
+    svm.setGamma(0)
+    svm.setKernel(cv2.ml.SVM_LINEAR)
+    svm.setNu(0.5)
+    svm.setP(0.1)
+    svm.setC(0.01)
+    svm.setType(cv2.ml.SVM_C_SVC)
+    svm.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-3))
+
+    train_data = hog_convertor(gradient_list)
+    labels = np.array(labels, dtype=np.int32)
+
+    svm.train(train_data, cv2.ml.ROW_SAMPLE, labels)
+    svm.save(TRAINED_SVM)
+    print("SVM training completed and saved.")
+    return svm
+
+def svm_detector(svm):
+    support_vectors = svm.getSupportVectors()
+    rho, _, _ = svm.getDecisionFunction(0)
+    detector = np.append(support_vectors[0], -rho)
+    return detector
+
+def visualise(img, locations, color):
+    for loc in locations:
+        cv2.rectangle(img, loc, color, 2)
+
+def extract_frames_from_video(video_path, output_folder, max_frames=100, resize_dim=(40, 40)):
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video {input_path}")
+        print(f"Failed to open video: {video_path}")
+        return
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    os.makedirs(output_folder, exist_ok=True)
+    frame_count = 0
+    extracted = 0
 
-    if resize_to:
-        out_size = resize_to
-    else:
-        out_size = (width, height)
+    while frame_count < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, out_size)
+        frame = cv2.resize(frame, resize_dim)
+        save_path = os.path.join(output_folder, f"frame_{extracted}.jpg")
+        cv2.imwrite(save_path, frame)
+        extracted += 1
+        frame_count += 1
 
-    total_vehicles = 0
-    frame_idx = 0
+    cap.release()
+    print(f"{extracted} frames saved to {output_folder}")
+
+def test():
+    svm = cv2.ml.SVM_load(TRAINED_SVM)
+
+    hog = cv2.HOGDescriptor(_winSize=IMAGE_SIZE,
+                            _blockSize=(16, 16),
+                            _blockStride=(8, 8),
+                            _cellSize=(8, 8),
+                            _nbins=9)
+    detector = svm_detector(svm)
+    hog.setSVMDetector(detector)
+
+    cap = cv2.VideoCapture(TRAFFIC_VIDEO_FILE)
+    if not cap.isOpened():
+        print("Failed to open video.")
+        return
+
+    num_of_vehicles = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frame_idx += 1
-        if frame_step > 1 and (frame_idx % frame_step != 0):
-            # still write original frame (or skip writing if you prefer)
-            writer.write(cv2.resize(frame, out_size))
-            continue
 
-        frame_proc = (cv2.resize(frame, resize_to) if resize_to else frame.copy())
+        draw = frame.copy()
+        frame[:, frame.shape[1]//2:] = 0
 
-        # === CALL YOUR DETECTION LOGIC HERE ===
-        # Example contract: detect_boxes_in_frame returns list of (x,y,w,h)
-        # boxes = detect_boxes_in_frame(frame_proc, model, hog)
-        # For now put a placeholder:
-        # boxes = []  # REPLACE with actual detection
-        # =======================================
+        rects, _ = hog.detectMultiScale(frame)
+        visualise(draw, rects, (0, 255, 0))
 
-        # draw boxes
-        for (x, y, w, h) in boxes:
-            cv2.rectangle(frame_proc, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        for r in rects:
+            center = (r[0] + r[2] // 2, r[1] + r[3] // 2)
+            if abs(center[1] - frame.shape[0] * 2 // 3) < 2:
+                num_of_vehicles += 1
+                cv2.line(draw, (0, frame.shape[0]*2//3), (frame.shape[1]//2, frame.shape[0]*2//3), (0, 255, 0), 3)
+            else:
+                cv2.line(draw, (0, frame.shape[0]*2//3), (frame.shape[1]//2, frame.shape[0]*2//3), (0, 0, 255), 3)
 
-        total_vehicles += len(boxes)
-
-        # ensure output frame size matches writer
-        out_frame = cv2.resize(frame_proc, out_size)
-        writer.write(out_frame)
+        cv2.imshow(WINDOW_NAME, draw)
+        if cv2.waitKey(10) == 27:
+            break
 
     cap.release()
-    writer.release()
-    return {"total_vehicles": total_vehicles}
+    cv2.destroyAllWindows()
+
+def main():
+    if EVALUATE_ONLY:
+        print("Evaluating SVM model...")
+        pos_images = load_images(POSITIVE_TRAINING_SET_PATH)
+        neg_images = load_images(NEGATIVE_TRAINING_SET_PATH)
+
+        pos_gradients = hog_calculator(pos_images)
+        neg_gradients = hog_calculator(neg_images)
+
+        gradients = pos_gradients + neg_gradients
+        labels = [1]*len(pos_gradients) + [-1]*len(neg_gradients)
+
+        X_train, X_test, y_train, y_test = train_test_split(gradients, labels, test_size=0.2, random_state=42)
+        svm = train_svm_model(X_train, y_train)
+
+        y_pred = svm.predict(hog_convertor(X_test))[1].ravel()
+        print("Accuracy:", accuracy_score(y_test, y_pred))
+        print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+        return  # Don't run the test() function after evaluation-only
+
+    if not model_exists(TRAINED_SVM):
+        print("Model not found. Extracting frames from videos for training...")
+
+        extract_frames_from_video(POSITIVE_TRAINING_VIDEO, POSITIVE_TRAINING_SET_PATH, max_frames=200)
+        extract_frames_from_video(NEGATIVE_TRAINING_VIDEO, NEGATIVE_TRAINING_SET_PATH, max_frames=200)
+
+        pos_images = load_images(POSITIVE_TRAINING_SET_PATH)
+        neg_images = load_images(NEGATIVE_TRAINING_SET_PATH)
+
+        pos_gradients = hog_calculator(pos_images)
+        neg_gradients = hog_calculator(neg_images)
+
+        gradients = pos_gradients + neg_gradients
+        labels = [1]*len(pos_gradients) + [-1]*len(neg_gradients)
+
+        train_svm_model(gradients, labels)
+
+    test()
+
+if __name__ == "__main__":
+    main()
